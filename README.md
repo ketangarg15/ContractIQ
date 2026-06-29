@@ -243,7 +243,3 @@ Progress for each stage streams to the frontend via Server-Sent Events, so the U
 - LLM calls depend on Groq's API and its rate limits; heavy iterative testing can exhaust daily token quotas on free-tier usage.
 
 ---
-
-## License
-
-Add your license here.
