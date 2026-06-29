@@ -7,3 +7,5 @@ vector_store/
 scratch/
 venv/
 contract_texts/
+frontend/node_modules/
+frontend/.next/
