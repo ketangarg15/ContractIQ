@@ -174,7 +174,7 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
     # Chunk text & build vector store scoped by contract_id
     try:
         chunks = chunk_text(text)
-        build_vector_store(chunks, contract_id)
+        # build_vector_store(chunks, contract_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build vector store: {str(e)}")
 
