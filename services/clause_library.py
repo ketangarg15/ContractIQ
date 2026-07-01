@@ -1,12 +1,20 @@
 """
 Clause library service.
 
-Stores and retrieves reusable legal clauses in SQLite.
+Stores and retrieves reusable legal clauses in SQLite (local)
+or Postgres via DATABASE_URL env var (Supabase / production).
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Reads the same DATABASE_URL used by history.py — both files share one DB.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -49,14 +57,14 @@ class ClauseRecord(_ClauseBase):
 
 
 def _get_engine():
-    """Create and return the SQLAlchemy engine."""
-    DATABASE_DIR.mkdir(exist_ok=True)
-    engine = create_engine(
-        f"sqlite:///{DATABASE_PATH}",
-        echo=False,
-        connect_args={"check_same_thread": False},
-    )
-    return engine
+    """Create and return the SQLAlchemy engine.
+
+    Uses Postgres (Supabase) when DATABASE_URL env var is set.
+    Raises ValueError if DATABASE_URL is not set to prevent SQLite fallback.
+    """
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is required but not set.")
+    return create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
 def _get_session() -> Session:

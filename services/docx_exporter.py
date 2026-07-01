@@ -3,29 +3,47 @@ Word (.docx) report exporter service.
 """
 
 import io
+import json
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 
+def _parse_json(val):
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:
+            return val
+    return val
+
 def generate_docx_report(
     filename: str,
-    summary: dict | None,
-    clauses: dict | None,
-    risk_analysis: dict | None,
+    summary: dict | str | None,
+    clauses: dict | str | None,
+    risk_analysis: dict | str | None,
     risk_score: float | None,
     contract_type: str | None,
-    obligations: dict | None,
-    entities: dict | None,
-    red_flags: dict | None,
-    compliance: dict | None,
-    negotiations: dict | None,
+    obligations: dict | str | None,
+    entities: dict | str | None,
+    red_flags: dict | str | None,
+    compliance: dict | str | None,
+    negotiations: dict | str | None,
 ) -> bytes:
     """Generates a Microsoft Word document containing contract analytics and negotiation redlines."""
+    summary = _parse_json(summary)
+    clauses = _parse_json(clauses)
+    risk_analysis = _parse_json(risk_analysis)
+    obligations = _parse_json(obligations)
+    entities = _parse_json(entities)
+    red_flags = _parse_json(red_flags)
+    compliance = _parse_json(compliance)
+    negotiations = _parse_json(negotiations)
+
     doc = Document()
     
     # Title Section
-    title = doc.add_title('ContractIQ — Legal Analysis & Redline Report', 0)
+    title = doc.add_heading('ContractIQ — Legal Analysis & Redline Report', level=0)
     title.style.font.size = Pt(24)
-    title.style.font.color.rgb = RGBColor(37, 99, 235) # Premium blue color
+    title.style.font.color.rgb = RGBColor(37, 99, 235)  # Premium blue color
     
     # Metadata Block
     doc.add_heading('1. Metadata & Classification', level=1)

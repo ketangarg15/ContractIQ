@@ -3,12 +3,12 @@
 import React, { useState, useRef, useEffect } from "react";
 import { Send, Bot } from "lucide-react";
 import { useContract } from "@/context/ContractContext";
-import { chatWithContract } from "@/lib/api";
+import { chatWithContract, fetchChatHistory } from "@/lib/api";
 import { ChatMessage } from "@/types";
 import { toast } from "sonner";
 
 // ── Inline renderer: bold + [Source N] chips ────────────────────────────────
-const parseInline = (text: string, key: string | number): React.ReactNode => {
+const parseInline = (text: string, key: string | number, citations: string[] = []): React.ReactNode => {
   const parts: React.ReactNode[] = [];
   const regex = /(\*\*(.*?)\*\*|\[Source\s*(\d+)\])/g;
   let last = 0;
@@ -22,10 +22,15 @@ const parseInline = (text: string, key: string | number): React.ReactNode => {
         </strong>
       );
     } else if (match[3] !== undefined) {
+      const srcIdx = parseInt(match[3], 10) - 1;
+      const citationText = citations[srcIdx] || "";
+      // Clean up tooltip text to remove prefix if present
+      const cleanedTooltip = citationText.replace(/^\[Source\s*\d+\]\s*/i, "").trim();
       parts.push(
         <span
           key={`src-${key}-${match.index}`}
-          className="inline-flex items-center mx-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded bg-indigo-100 text-indigo-700 border border-indigo-200 align-middle"
+          title={cleanedTooltip || `Source ${match[3]}`}
+          className="inline-flex items-center mx-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded bg-indigo-100 text-indigo-700 border border-indigo-200 align-middle cursor-pointer"
         >
           Source {match[3]}
         </span>
@@ -38,7 +43,7 @@ const parseInline = (text: string, key: string | number): React.ReactNode => {
 };
 
 // ── Full message formatter ───────────────────────────────────────────────────
-const renderFormattedContent = (content: string) => {
+const renderFormattedContent = (content: string, citations: string[] = []) => {
   const lines = content.split("\n");
   const nodes: React.ReactNode[] = [];
   let i = 0;
@@ -89,17 +94,24 @@ const renderFormattedContent = (content: string) => {
               Sources Used
             </p>
             <div className="flex flex-col gap-1.5">
-              {sources.map((src, si) => (
-                <span
-                  key={si}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200"
-                >
-                  <span className="bg-indigo-200 text-indigo-700 rounded px-1 font-bold text-[10px]">
-                    Source {si + 1}
+              {sources.map((src, si) => {
+                const citationText = citations[si] || "";
+                const cleanedExcerpt = citationText.replace(/^\[Source\s*\d+\]\s*/i, "").trim();
+                return (
+                  <span
+                    key={si}
+                    title={cleanedExcerpt}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 cursor-pointer"
+                  >
+                    <span className="bg-indigo-200 text-indigo-700 rounded px-1 font-bold text-[10px] shrink-0">
+                      Source {si + 1}
+                    </span>
+                    <span className="truncate flex-1 text-slate-600 font-normal">
+                      {cleanedExcerpt || src.replace(/^\s*:\s*/, "")}
+                    </span>
                   </span>
-                  {src}
-                </span>
-              ))}
+                );
+              })}
             </div>
           </div>
         );
@@ -113,7 +125,7 @@ const renderFormattedContent = (content: string) => {
       nodes.push(
         <div key={`li-${i}`} className="flex items-start gap-2 mt-1">
           <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0" />
-          <p className="text-sm text-slate-700 leading-relaxed">{parseInline(bm[1], i)}</p>
+          <p className="text-sm text-slate-700 leading-relaxed">{parseInline(bm[1], i, citations)}</p>
         </div>
       );
       i++;
@@ -126,7 +138,7 @@ const renderFormattedContent = (content: string) => {
       nodes.push(
         <div key={`num-${i}`} className="flex items-start gap-2 mt-1">
           <span className="mt-0.5 min-w-[20px] text-xs font-bold text-indigo-500">{nm[1]}.</span>
-          <p className="text-sm text-slate-700 leading-relaxed">{parseInline(nm[2], i)}</p>
+          <p className="text-sm text-slate-700 leading-relaxed">{parseInline(nm[2], i, citations)}</p>
         </div>
       );
       i++;
@@ -135,8 +147,8 @@ const renderFormattedContent = (content: string) => {
 
     // Paragraph
     nodes.push(
-      <p key={`p-${i}`} className="text-sm text-slate-700 leading-relaxed mt-1">
-        {parseInline(trimmed, i)}
+      <p key={`p-${i}`} className="text-sm text-slate-800 leading-relaxed mt-2.5">
+        {parseInline(trimmed, i, citations)}
       </p>
     );
     i++;
@@ -161,34 +173,57 @@ export default function KnowledgePage() {
     scrollToBottom();
   }, [messages, isTyping]);
 
-  // Load/save chat history per contract from localStorage
+  // Load chat history per contract from DB
   useEffect(() => {
     if (!contract) return;
-    const key = `chat_history_${contract.id}`;
-    const saved = localStorage.getItem(key);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        setMessages(parsed);
+    
+    let isMounted = true;
+    const loadHistory = async () => {
+      if (isUsingMockData) {
+        // Fallback welcome message in mock mode
+        setMessages([
+          {
+            id: "welcome",
+            role: "assistant",
+            content: `Hello! [MOCK MODE] I've loaded **${contract.name.replace(".pdf", "")}**. I can answer questions about its clauses.`,
+          },
+        ]);
         return;
-      } catch {}
-    }
-    // First visit for this contract
-    setMessages([
-      {
-        id: "welcome",
-        role: "assistant",
-        content: `Hello! I've loaded **${contract.name.replace(".pdf", "")}**. I can answer questions about its clauses, obligations, renewal terms, or find specific references. What would you like to know?`,
-      },
-    ]);
-  }, [contract?.id]);
+      }
+      
+      try {
+        const history = await fetchChatHistory(contract.id);
+        if (!isMounted) return;
+        
+        if (history && history.length > 0) {
+          setMessages(history);
+        } else {
+          setMessages([
+            {
+              id: "welcome",
+              role: "assistant",
+              content: `Hello! I've loaded **${contract.name.replace(".pdf", "")}**. I can answer questions about its clauses, obligations, renewal terms, or find specific references. What would you like to know?`,
+            },
+          ]);
+        }
+      } catch (err) {
+        console.error("Failed to load chat history:", err);
+        // Welcome fallback on error
+        setMessages([
+          {
+            id: "welcome",
+            role: "assistant",
+            content: `Hello! I've loaded **${contract.name.replace(".pdf", "")}**. I can answer questions about its clauses, obligations, renewal terms, or find specific references. What would you like to know?`,
+          },
+        ]);
+      }
+    };
 
-  // Persist messages to localStorage whenever they change
-  useEffect(() => {
-    if (!contract || messages.length === 0) return;
-    const key = `chat_history_${contract.id}`;
-    localStorage.setItem(key, JSON.stringify(messages));
-  }, [messages, contract?.id]);
+    loadHistory();
+    return () => {
+      isMounted = false;
+    };
+  }, [contract?.id, isUsingMockData]);
 
   const suggestedPrompts = [
     "What are the termination notice requirements?",
@@ -248,6 +283,10 @@ export default function KnowledgePage() {
             role: "assistant",
             content:
               "Based on the contracts in your workspace, I've analysed your query. While this is a simulated response, in a production environment I would connect to the backend AI to retrieve specific clauses and answer accurately based on the verified documents.",
+            citations: [
+              "[Source 1] Section 4.1 Data Processing - Describes data limits and encryption requirements.",
+              "[Source 2] Exhibit B SLA - Outlines service availability and uptime commitments."
+            ]
           },
         ]);
         setIsTyping(false);
@@ -273,19 +312,18 @@ export default function KnowledgePage() {
         {messages.map(msg => (
           <div
             key={msg.id}
-            className={`flex gap-4 max-w-3xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""}`}
+            className={`flex gap-3 max-w-3xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""}`}
           >
             {msg.role === "assistant" && (
-              <div className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center shrink-0 mt-1 border border-indigo-200">
-                <Bot className="w-4 h-4 text-indigo-700" />
+              <div className="w-8 h-8 rounded-full bg-indigo-50 flex items-center justify-center shrink-0 mt-6 border border-indigo-100">
+                <Bot className="w-4 h-4 text-indigo-600" />
               </div>
             )}
-            <div className="space-y-1">
-              {msg.role === "assistant" && (
-                <p className="text-sm font-medium text-slate-700 flex items-center gap-2 mb-2">
-                  ContractIQ Assistant
-                </p>
-              )}
+            <div className="space-y-1 flex-1">
+              {/* Metadata label */}
+              <p className={`text-[10px] font-bold text-slate-400 tracking-wider uppercase mb-1.5 ${msg.role === 'user' ? 'text-right pr-2' : 'pl-2'}`}>
+                {msg.role === 'user' ? 'You' : 'ContractIQ AI'}
+              </p>
               <div
                 className={`${
                   msg.role === "user"
@@ -294,9 +332,9 @@ export default function KnowledgePage() {
                 } text-sm leading-relaxed`}
               >
                 {msg.role === "user" ? (
-                  <p className="whitespace-pre-line">{msg.content}</p>
+                  <p className="whitespace-pre-line text-white font-medium">{msg.content}</p>
                 ) : (
-                  <div className="space-y-1">{renderFormattedContent(msg.content)}</div>
+                  <div className="space-y-2">{renderFormattedContent(msg.content, msg.citations)}</div>
                 )}
               </div>
             </div>

@@ -282,6 +282,75 @@ export default function SummaryPage() {
           )}
         </div>
       </div>
+
+      {/* Reviewer Notes Section */}
+      <ReviewerNotesCard contractId={contract.id} initialNotes={contract.notes || ""} />
+    </div>
+  );
+}
+
+interface ReviewerNotesCardProps {
+  contractId: string;
+  initialNotes: string;
+}
+
+function ReviewerNotesCard({ contractId, initialNotes }: ReviewerNotesCardProps) {
+  const [notes, setNotes] = useState(initialNotes);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
+  const { refreshContracts } = useContract();
+
+  useEffect(() => {
+    setNotes(initialNotes);
+    setIsDirty(false);
+  }, [initialNotes]);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      const { updateContractNotes } = await import("@/lib/api");
+      await updateContractNotes(contractId, notes);
+      setIsDirty(false);
+      toast.success("Reviewer notes saved successfully");
+      await refreshContracts();
+    } catch (err) {
+      toast.error("Failed to save reviewer notes");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden p-6 sm:p-8 space-y-4">
+      <div>
+        <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Reviewer Notes & Annotations</h3>
+        <p className="text-slate-500 text-xs mt-1">Add custom legal notes, negotiation progress updates, or internal guidance for this contract. Saved notes are persisted in the database.</p>
+      </div>
+      
+      <textarea
+        value={notes}
+        onChange={(e) => {
+          setNotes(e.target.value);
+          setIsDirty(true);
+        }}
+        placeholder="Type reviewer notes here..."
+        className="w-full min-h-[120px] p-3 text-sm text-slate-700 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+        disabled={isSaving}
+      />
+
+      <div className="flex justify-end">
+        <button
+          onClick={handleSave}
+          disabled={!isDirty || isSaving}
+          className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all shadow-sm ${
+            isDirty && !isSaving
+              ? "bg-[#2563eb] hover:bg-blue-600 text-white cursor-pointer active:scale-95"
+              : "bg-slate-50 border border-slate-200 text-slate-400 cursor-not-allowed"
+          }`}
+        >
+          {isSaving ? "Saving..." : "Save Notes"}
+        </button>
+      </div>
     </div>
   );
 }

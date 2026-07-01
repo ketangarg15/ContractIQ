@@ -20,6 +20,11 @@ interface ContractContextType {
   signup: (payload: any) => Promise<any>;
   logout: () => void;
   updateContractStatus: (id: string, status: string) => Promise<void>;
+  updateContractClauseById: (
+    contractId: string,
+    clauseId: string,
+    payload: { status?: string; riskLevel?: string }
+  ) => Promise<void>;
   userProfile: { name: string; initials: string; email: string };
   updateUserProfile: (profile: { name: string; initials: string; email: string }) => void;
   notifications: NotificationItem[];
@@ -153,9 +158,11 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const { fetchContracts: apiFetchContracts } = await import("@/lib/api");
     try {
       setLoading(true);
-      const data = await apiFetchContracts();
+      const raw = await apiFetchContracts();
 
-      if (data && data.length > 0) {
+      if (raw && raw.length > 0) {
+        // Normalize all IDs to strings so === comparisons work everywhere
+        const data: Contract[] = raw.map((c: any) => ({ ...c, id: String(c.id) }));
         setContracts(data);
         setIsUsingMockData(false);
         if (!selectedContractId || !data.some((c: Contract) => c.id === selectedContractId)) {
@@ -229,6 +236,65 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const updateContractClauseById = async (
+    contractId: string,
+    clauseId: string,
+    payload: { status?: string; riskLevel?: string }
+  ) => {
+    if (isUsingMockData) {
+      setContracts(prev =>
+        prev.map(c => {
+          if (c.id !== contractId) return c;
+          const updatedClauses = c.clauses?.map(cl => {
+            if (cl.id !== clauseId) return cl;
+            const history = cl.reviewHistory ? [...cl.reviewHistory] : [];
+            const user_name = userProfile.name || "Legal Counsel";
+            const now_str = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+            
+            let updatedCl = { ...cl };
+            if (payload.status) {
+              updatedCl.status = payload.status as any;
+              history.push({
+                id: (history.length + 1).toString(),
+                user: user_name,
+                action: `Confirmed AI Verdict: ${cl.riskLevel}`,
+                date: now_str
+              });
+            }
+            if (payload.riskLevel) {
+              updatedCl.riskLevel = payload.riskLevel as any;
+              updatedCl.status = "Confirmed";
+              history.push({
+                id: (history.length + 1).toString(),
+                user: user_name,
+                action: `Overrode Risk Level from ${cl.riskLevel} to ${payload.riskLevel}`,
+                date: now_str
+              });
+            }
+            updatedCl.reviewHistory = history;
+            return updatedCl;
+          });
+          return { ...c, clauses: updatedClauses };
+        })
+      );
+      toast.success("Clause updated (mock mode)");
+      return;
+    }
+
+    try {
+      const { updateContractClause } = await import("@/lib/api");
+      await updateContractClause(contractId, clauseId, {
+        status: payload.status,
+        riskLevel: payload.riskLevel,
+        username: userProfile.name || undefined
+      });
+      toast.success("Clause review updated successfully");
+      await refreshContracts();
+    } catch (err) {
+      toast.error("Failed to update clause review");
+    }
+  };
+
   const selectedContract = contracts.find(c => c.id === selectedContractId) || null;
 
   return (
@@ -247,6 +313,7 @@ export function ContractProvider({ children }: { children: ReactNode }) {
         signup,
         logout,
         updateContractStatus,
+        updateContractClauseById,
         userProfile,
         updateUserProfile,
         notifications,

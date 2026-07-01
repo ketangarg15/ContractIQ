@@ -78,23 +78,51 @@ def _save_vector_store(index: faiss.Index, chunks: list[str], contract_id: str |
 def load_vector_store(contract_id: str | int) -> Optional[tuple[faiss.Index, list[str]]]:
     """Load existing FAISS index and chunks from disk.
 
+    If the index files are not found (e.g. ephemeral Render disk was wiped on
+    restart/redeploy), automatically attempts to rebuild the index from the
+    contract's saved raw text at ``contract_texts/{contract_id}.txt``.
+
     Args:
         contract_id: The ID of the contract.
 
     Returns:
-        A tuple of (FAISS index, chunks list) if found, None otherwise.
+        A tuple of (FAISS index, chunks list).
+
+    Raises:
+        FileNotFoundError: If both the vector store AND the raw contract text
+            are missing — the contract needs to be re-uploaded.
     """
     index_path, chunks_path = get_paths(contract_id)
-    if not index_path.exists() or not chunks_path.exists():
-        return None
 
+    # Fast path: index already on disk
+    if index_path.exists() and chunks_path.exists():
+        try:
+            index = faiss.read_index(str(index_path))
+            with open(chunks_path, "rb") as f:
+                chunks = pickle.load(f)
+            return index, chunks
+        except Exception:
+            pass  # Corrupted files — fall through to rebuild
+
+    # Rebuild path: vector store missing, retrieve raw text using get_contract_text
     try:
-        index = faiss.read_index(str(index_path))
-        with open(chunks_path, "rb") as f:
-            chunks = pickle.load(f)
+        from services.storage_client import get_contract_text
+        text = get_contract_text(contract_id)
+        from services.chunker import chunk_text
+        chunks = chunk_text(text)
+        index, chunks = build_vector_store(chunks, contract_id)
         return index, chunks
-    except Exception:
-        return None
+    except FileNotFoundError:
+        # Both missing — contract must be re-uploaded
+        raise FileNotFoundError(
+            f"Vector store and contract text for contract {contract_id} are both "
+            f"missing. Please re-upload the contract to regenerate the index."
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to rebuild vector store for contract {contract_id} "
+            f"from saved text: {e}"
+        )
 
 
 def search_similar_chunks(

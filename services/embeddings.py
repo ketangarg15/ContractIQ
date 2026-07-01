@@ -2,20 +2,24 @@
 Embedding service.
 
 Generates vector embeddings using the SentenceTransformer model.
-Uses Streamlit caching to avoid expensive model reloads.
+Uses functools.lru_cache to load the model once and cache it in-process
+(replaces the legacy @st.cache_resource which only works in Streamlit context).
 """
 
 import numpy as np
-import streamlit as st
+from functools import lru_cache
 from sentence_transformers import SentenceTransformer
 
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-@st.cache_resource(show_spinner="Loading embedding model...")
+@lru_cache(maxsize=1)
 def get_embedding_model() -> SentenceTransformer:
     """Load and cache the SentenceTransformer model.
+
+    Cached via lru_cache so the model is only loaded once per process,
+    regardless of how many times this function is called.
 
     Returns:
         A cached SentenceTransformer model instance.

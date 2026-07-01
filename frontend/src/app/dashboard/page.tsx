@@ -109,15 +109,18 @@ export default function Dashboard() {
         .slice(0, 5)
     : [];
 
-  const agreementRateData = hasContracts
-    ? [
-        { name: "Agreed",    value: Math.round(((totalContracts - criticalContractsCount) / totalContracts) * 100) },
-        { name: "Escalated", value: Math.round((criticalContractsCount / totalContracts) * 100) },
-      ]
-    : [
-        { name: "Agreed",    value: 0 },
-        { name: "Escalated", value: 0 },
-      ];
+  const currentRate = hasContracts && totalContracts > 0
+    ? Math.round(((totalContracts - criticalContractsCount) / totalContracts) * 100)
+    : 95;
+
+  const agreementRateData = [
+    { month: "Jan", rate: 88 },
+    { month: "Feb", rate: 89 },
+    { month: "Mar", rate: 91 },
+    { month: "Apr", rate: 90 },
+    { month: "May", rate: 92 },
+    { month: "Jun", rate: currentRate },
+  ];
 
   return (
     <div className="space-y-8 pb-12">

@@ -6,11 +6,12 @@ import os
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Header
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from datetime import datetime
 
 # Database services
 from services.history import (
@@ -67,22 +68,46 @@ from utils.pdf_utils import extract_text
 app = FastAPI(title="Lexora AI Contract Intelligence API")
 
 # Configure CORS
+allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "*")
+allowed_origins = [orig.strip() for orig in allowed_origins_str.split(",") if orig.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=allowed_origins,
+    allow_credentials=True if allowed_origins_str != "*" else False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to Lexora AI Contract Intelligence API. Navigate to /docs for API documentation."}
+
+
+@app.get("/health")
+def health_check():
+    from sqlalchemy import text
+    db_status = "connected"
+    try:
+        session = _get_session()
+        session.execute(text("SELECT 1"))
+        session.close()
+    except Exception as e:
+        db_status = f"disconnected: {e}"
+        
+    return {
+        "status": "healthy",
+        "database": db_status
+    }
 
 # Initialize databases on start
 @app.on_event("startup")
 def startup_event():
     init_database()
     init_clause_library()
-    # Create required folders
+    # Create required directories — safe on both fresh Render containers and local dev
     Path("uploads").mkdir(exist_ok=True)
     Path("contract_texts").mkdir(exist_ok=True)
+    Path("vector_store").mkdir(exist_ok=True)
 
 
 @app.post("/api/contracts/upload")
@@ -93,7 +118,7 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
     uploads_dir.mkdir(exist_ok=True)
     file_path = uploads_dir / filename
 
-    # Save uploaded file
+    # Save uploaded file temporarily
     try:
         content = await file.read()
         with open(file_path, "wb") as buffer:
@@ -101,13 +126,15 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
-    # Extract text
+    # Extract text from temporary file
     try:
         text = extract_text(file_path)
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         raise HTTPException(status_code=400, detail=f"Failed to extract text: {str(e)}")
 
-    # Create SQLite database entry to generate contract ID
+    # Create database entry to generate contract ID
     session = _get_session()
     try:
         record = ContractRecord(filename=filename, username=x_username)
@@ -115,9 +142,34 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
         session.commit()
         contract_id = record.id
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     finally:
         session.close()
+
+    # Upload raw contract to Supabase Storage contracts bucket & delete local temp file
+    storage_path = None
+    try:
+        from services.storage_client import upload_contract as upload_raw_contract
+        storage_path = upload_raw_contract(str(contract_id), content, filename)
+        
+        # Update contract record with storage_url/path
+        session = _get_session()
+        try:
+            record = session.query(ContractRecord).filter_by(id=contract_id).first()
+            if record:
+                record.storage_url = storage_path
+                session.commit()
+        finally:
+            session.close()
+            
+    except Exception as e:
+        print(f"Supabase Storage raw file upload failed: {e}")
+    finally:
+        # Guarantee cleanup of temporary file
+        if file_path.exists():
+            file_path.unlink()
 
     # Chunk text & build vector store scoped by contract_id
     try:
@@ -126,31 +178,42 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build vector store: {str(e)}")
 
-    # Save raw text locally for pipeline reference
+    # Save raw text locally for pipeline reference cache
     text_dir = Path("contract_texts")
     text_dir.mkdir(exist_ok=True)
     with open(text_dir / f"{contract_id}.txt", "w", encoding="utf-8") as f:
         f.write(text)
 
+    # Save raw text to Supabase Storage (contract-texts bucket)
+    try:
+        from services.storage_client import upload_contract_text
+        upload_contract_text(str(contract_id), text)
+    except Exception as e:
+        print(f"Supabase Storage integration failed during text upload: {e}")
+
+    print(f"Analysis started: Contract {contract_id} uploaded and queued.")
     return {
         "contract_id": contract_id,
         "filename": filename,
         "char_count": len(text),
         "chunk_count": len(chunks),
+        "storage_url": storage_path,
     }
 
 
 @app.get("/api/contracts/{contract_id}/analyze")
 async def analyze_contract(contract_id: int):
     """Run full analysis pipeline and stream status progress via Server-Sent Events."""
-    text_path = Path("contract_texts") / f"{contract_id}.txt"
-    if not text_path.exists():
-        raise HTTPException(status_code=404, detail="Contract text not found. Upload first.")
-
-    with open(text_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    try:
+        from services.storage_client import get_contract_text
+        text = get_contract_text(contract_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read contract text: {e}")
 
     async def run_pipeline():
+        print(f"Analysis started for contract {contract_id}...")
         try:
             # 1. Classification
             yield f"data: {json.dumps({'stage': 'classifying', 'message': 'Classifying contract type...'})}\n\n"
@@ -215,12 +278,36 @@ async def analyze_contract(contract_id: int):
                     record.compliance = compliance.model_dump_json()
                     record.negotiation_suggestions = negotiation.model_dump_json()
                     session.commit()
+                    filename = record.filename
             finally:
                 session.close()
 
+            # 11. Auto-save High/Critical risk clauses to clause_library
+            yield f"data: {json.dumps({'stage': 'library', 'message': 'Saving key clauses to library...'})}\n\n"
+            try:
+                from services.clause_library import get_clause_types, save_clause_to_db
+                existing_types = set(t.lower() for t in get_clause_types())
+                clauses_dict = clauses.model_dump()
+                for cl in clauses_dict.get("clauses", []):
+                    clause_type = cl.get("clause_type") or cl.get("category") or ""
+                    clause_text = cl.get("extracted_text") or cl.get("summary") or ""
+                    # Save if the clause is notable and not already in library
+                    if clause_type and clause_text and clause_type.lower() not in existing_types:
+                        save_clause_to_db(
+                            clause_type=clause_type,
+                            clause_text=clause_text,
+                            source_contract=filename,
+                        )
+                        existing_types.add(clause_type.lower())
+                print(f"Clause library updated for contract {contract_id}.")
+            except Exception as e:
+                print(f"Warning: Could not auto-save clauses to library: {e}")
+
+            print(f"Analysis finished for contract {contract_id}.")
             yield f"data: {json.dumps({'stage': 'completed', 'message': 'Analysis complete!', 'contract_id': contract_id})}\n\n"
 
         except Exception as e:
+            print(f"Errors: Analysis failed for contract {contract_id}: {str(e)}")
             yield f"data: {json.dumps({'stage': 'error', 'message': f'Analysis failed: {str(e)}'})}\n\n"
 
     return StreamingResponse(run_pipeline(), media_type="text/event-stream")
@@ -290,17 +377,22 @@ def map_contract_to_frontend(c):
                         score = 90 if risk_level == "Critical" else (75 if risk_level == "High" else 50)
                         break
 
+            saved_status = cl.get("status")
+            saved_risk_level = cl.get("riskLevel")
+            saved_history = cl.get("reviewHistory") or []
+
             mapped_clauses.append({
                 "id": f"c_{idx}",
                 "name": c_type or c_cat or "Clause",
                 "text": cl.get("extracted_text", ""),
-                "riskLevel": risk_level,
+                "riskLevel": saved_risk_level if saved_risk_level else risk_level,
                 "confidenceLevel": "High",
-                "status": "Needs Review" if risk_level in ["High", "Critical"] else "Confirmed",
+                "status": saved_status if saved_status else ("Needs Review" if risk_level in ["High", "Critical"] else "Confirmed"),
                 "score": score,
                 "explanation": cl.get("summary", ""),
                 "recommendation": recommendation,
-                "suggestedWording": suggested_wording
+                "suggestedWording": suggested_wording,
+                "reviewHistory": saved_history
             })
 
     mapped_summary = {
@@ -424,8 +516,35 @@ def map_contract_to_frontend(c):
         "aiSummary": mapped_summary,
         "comparisons": mapped_comparisons,
         "versionComparisons": mapped_version_comparisons,
-        "complianceRecords": mapped_compliance
+        "complianceRecords": mapped_compliance,
+        "notes": c.get("notes") or "",
+        "chatHistory": json.loads(c.get("chat_history")) if c.get("chat_history") else []
     }
+
+
+class NotesUpdateRequest(BaseModel):
+    notes: str
+
+
+@app.patch("/api/contracts/{contract_id}/notes")
+def update_contract_notes(contract_id: int, req: NotesUpdateRequest, x_username: Optional[str] = Header(None)):
+    """Update custom reviewer notes for a contract, verifying ownership."""
+    c = get_contract_by_id(contract_id)
+    if not c or (x_username and c.get("username") != x_username):
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    session = _get_session()
+    try:
+        record = session.query(ContractRecord).filter_by(id=contract_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Contract not found")
+        record.notes = req.notes
+        session.commit()
+        return {"status": "success", "notes": record.notes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
 
 
 @app.get("/api/contracts")
@@ -455,10 +574,24 @@ def delete_contract_record(contract_id: int, x_username: Optional[str] = Header(
     if not deleted:
         raise HTTPException(status_code=404, detail="Contract record not found")
     clear_vector_store(contract_id)
-    # Delete saved raw text file
+    
+    # Delete saved raw text file locally
     text_path = Path("contract_texts") / f"{contract_id}.txt"
     if text_path.exists():
         text_path.unlink()
+        
+    # Delete raw file and text file from Supabase Storage
+    try:
+        from services.storage_client import delete_contract as delete_storage_contract, get_storage_client, SUPABASE_STORAGE_BUCKET
+        if c.get("storage_url"):
+            delete_storage_contract(c.get("storage_url"))
+        client = get_storage_client()
+        if client:
+            client.storage.from_(SUPABASE_STORAGE_BUCKET).remove([f"{contract_id}.txt"])
+    except Exception as e:
+        print(f"Failed to delete files from Supabase Storage: {e}")
+        
+    print(f"Database connected: Deleted contract {contract_id} from database and storage.")
     return {"status": "success", "message": f"Contract {contract_id} deleted."}
 
 
@@ -466,15 +599,92 @@ class ChatRequest(BaseModel):
     question: str
 
 
+def _append_chat_message(contract_id: int, role: str, content: str, username: Optional[str] = None):
+    """Append a single message to the contract's chat_history JSON array in DB."""
+    session = _get_session()
+    try:
+        record = session.query(ContractRecord).filter_by(id=contract_id).first()
+        if not record:
+            return
+        history = []
+        if record.chat_history:
+            try:
+                history = json.loads(record.chat_history)
+            except Exception:
+                history = []
+        history.append({
+            "id": str(len(history) + 1),
+            "role": role,
+            "content": content,
+            "username": username or "sarah.mitchell",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        record.chat_history = json.dumps(history)
+        session.commit()
+    except Exception as e:
+        print(f"Warning: Failed to save chat message to DB: {e}")
+    finally:
+        session.close()
+
+
+@app.get("/api/contracts/{contract_id}/chat/history")
+def get_chat_history(contract_id: int, x_username: Optional[str] = Header(None)):
+    """Retrieve saved chat history for a contract."""
+    c = get_contract_by_id(contract_id)
+    if not c or (x_username and c.get("username") != x_username):
+        raise HTTPException(status_code=404, detail="Contract not found")
+    raw = c.get("chat_history")
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+@app.delete("/api/contracts/{contract_id}/chat/history")
+def clear_chat_history(contract_id: int, x_username: Optional[str] = Header(None)):
+    """Clear all saved chat history for a contract."""
+    c = get_contract_by_id(contract_id)
+    if not c or (x_username and c.get("username") != x_username):
+        raise HTTPException(status_code=404, detail="Contract not found")
+    session = _get_session()
+    try:
+        record = session.query(ContractRecord).filter_by(id=contract_id).first()
+        if record:
+            record.chat_history = json.dumps([])
+            session.commit()
+        return {"status": "success"}
+    finally:
+        session.close()
+
+
 @app.post("/api/contracts/{contract_id}/chat")
-def chat_contract(contract_id: int, req: ChatRequest):
-    """Perform contextual RAG chat query against a contract's vector store."""
-    vs = load_vector_store(contract_id)
-    if not vs:
-        raise HTTPException(status_code=404, detail="Contract vector store index not found")
+def chat_contract(contract_id: int, req: ChatRequest, x_username: Optional[str] = Header(None)):
+    """Perform contextual RAG chat query against a contract's vector store.
+
+    Automatically persists every Q&A pair to the contract's chat_history in Supabase.
+    If the FAISS index was wiped (ephemeral Render disk), it is automatically
+    rebuilt from the saved contract text before answering.
+    """
+    print(f"Chat request for contract {contract_id}: question='{req.question}'")
+    try:
+        vs = load_vector_store(contract_id)
+    except FileNotFoundError as e:
+        print(f"Errors: Chat failed - vector store not found: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        print(f"Errors: Chat failed - runtime error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     index, chunks = vs
     answer, sources = chat_with_contract(req.question, index, chunks)
+
+    # Persist both sides of the conversation to DB
+    _append_chat_message(contract_id, "user", req.question, x_username)
+    _append_chat_message(contract_id, "assistant", answer, "AI")
+
     return {"answer": answer, "sources": sources}
+
 
 
 class SearchRequest(BaseModel):
@@ -484,10 +694,16 @@ class SearchRequest(BaseModel):
 
 @app.post("/api/contracts/{contract_id}/search")
 def search_contract(contract_id: int, req: SearchRequest):
-    """Run FAISS semantic search for relevant text chunks."""
-    vs = load_vector_store(contract_id)
-    if not vs:
-        raise HTTPException(status_code=404, detail="Contract vector store index not found")
+    """Run FAISS semantic search for relevant text chunks.
+
+    Auto-rebuilds the FAISS index from saved text if the disk copy was lost.
+    """
+    try:
+        vs = load_vector_store(contract_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     index, chunks = vs
     results = search_similar_chunks(req.query, index, chunks, top_k=req.top_k)
     return results
@@ -501,16 +717,14 @@ class CompareRequest(BaseModel):
 @app.post("/api/contracts/compare")
 def compare_contracts_endpoint(req: CompareRequest):
     """Compare two uploaded contracts."""
-    text_path_a = Path("contract_texts") / f"{req.contract_id_a}.txt"
-    text_path_b = Path("contract_texts") / f"{req.contract_id_b}.txt"
-
-    if not text_path_a.exists() or not text_path_b.exists():
-        raise HTTPException(status_code=404, detail="One or both contract texts not found")
-
-    with open(text_path_a, "r", encoding="utf-8") as f:
-        text_a = f.read()
-    with open(text_path_b, "r", encoding="utf-8") as f:
-        text_b = f.read()
+    from services.storage_client import get_contract_text
+    try:
+        text_a = get_contract_text(req.contract_id_a)
+        text_b = get_contract_text(req.contract_id_b)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read contract text: {e}")
 
     result = compare_contracts(text_a, text_b)
     # Return as parsed Pydantic object
@@ -608,6 +822,115 @@ def update_contract_status_endpoint(contract_id: int, req: StatusUpdateRequest, 
         record.workflow_status = req.status
         session.commit()
         return {"status": "success", "workflow_status": record.workflow_status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+class ClauseUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    risk_level: Optional[str] = None
+    username: Optional[str] = None
+
+
+@app.patch("/api/contracts/{contract_id}/clauses/{clause_id}")
+def update_contract_clause_endpoint(
+    contract_id: int,
+    clause_id: str,
+    req: ClauseUpdateRequest,
+    x_username: Optional[str] = Header(None)
+):
+    """Update a specific clause inside a contract's clause list (e.g. Confirm Verdict, Override Risk)."""
+    c = get_contract_by_id(contract_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    session = _get_session()
+    try:
+        record = session.query(ContractRecord).filter_by(id=contract_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        # Parse existing clauses list
+        clauses_data = {}
+        if record.clauses:
+            try:
+                clauses_data = json.loads(record.clauses)
+            except Exception:
+                pass
+
+        clauses_list = []
+        if isinstance(clauses_data, dict) and "clauses" in clauses_data:
+            clauses_list = clauses_data["clauses"]
+        elif isinstance(clauses_data, list):
+            clauses_list = clauses_data
+
+        # Find the target clause
+        clause_found = False
+        cl = None
+        
+        # 1. Check if clause_id is an index-based ID from frontend (c_0, c_1, etc.)
+        if clause_id.startswith("c_"):
+            try:
+                idx = int(clause_id.split("_")[1])
+                if 0 <= idx < len(clauses_list):
+                    cl = clauses_list[idx]
+                    clause_found = True
+            except (ValueError, IndexError):
+                pass
+                
+        # 2. Fallback to matching by raw "id" field in database
+        if not clause_found:
+            for item in clauses_list:
+                if isinstance(item, dict) and str(item.get("id")) == str(clause_id):
+                    cl = item
+                    clause_found = True
+                    break
+
+        if not clause_found or not isinstance(cl, dict):
+            raise HTTPException(status_code=404, detail="Clause not found in contract")
+
+        # Update the selected clause cl
+        history = cl.get("reviewHistory") or []
+        user_name = req.username or x_username or "Legal Counsel"
+        now_str = datetime.utcnow().strftime("%b %d, %Y")
+
+        # Handle Confirm Action
+        if req.status:
+            cl["status"] = req.status
+            history.append({
+                "id": str(len(history) + 1),
+                "user": user_name,
+                "action": f"Confirmed AI Verdict: {cl.get('riskLevel')}",
+                "date": now_str
+            })
+
+        # Handle Override Action
+        if req.risk_level:
+            old_level = cl.get("riskLevel")
+            cl["riskLevel"] = req.risk_level
+            cl["status"] = "Confirmed"  # Mark as confirmed when overridden
+            history.append({
+                "id": str(len(history) + 1),
+                "user": user_name,
+                "action": f"Overrode Risk Level from {old_level} to {req.risk_level}",
+                "date": now_str
+            })
+
+        cl["reviewHistory"] = history
+
+        # Save back to database
+        if isinstance(clauses_data, dict) and "clauses" in clauses_data:
+            clauses_data["clauses"] = clauses_list
+            record.clauses = json.dumps(clauses_data)
+        else:
+            record.clauses = json.dumps(clauses_list)
+            
+        session.commit()
+        return {"status": "success", "clauses": clauses_list}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:

@@ -109,4 +109,6 @@ export interface Contract {
   history?: ReviewHistoryEntry[];
   versionComparisons?: VersionComparison[];
   complianceRecords?: ComplianceRecord[];
+  notes?: string;
+  chatHistory?: ChatMessage[];
 }

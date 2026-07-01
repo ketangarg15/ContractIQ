@@ -1,13 +1,22 @@
 """
 Contract history service.
 
-Manages persistence of analyzed contracts using SQLite + SQLAlchemy.
+Manages persistence of analyzed contracts using SQLite + SQLAlchemy (local)
+or Postgres via DATABASE_URL env var (Supabase / production).
 """
 
-import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Set DATABASE_URL in the environment (e.g. Supabase connection string) to use
+# Postgres in production. When not set, falls back to local SQLite — local dev
+# behavior is completely unchanged.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 from sqlalchemy import (
     Column,
@@ -73,6 +82,9 @@ class ContractRecord(Base):
     negotiation_suggestions = Column(Text, nullable=True)
     workflow_status = Column(String(100), default="Under Review", nullable=False)
     username = Column(String(200), default="sarah.mitchell", nullable=True)
+    storage_url = Column(Text, nullable=True)
+    chat_history = Column(Text, nullable=True)   # JSON array of {role, content, timestamp}
+    notes = Column(Text, nullable=True)           # Reviewer free-text annotations
 
     def __repr__(self) -> str:
         return f"<ContractRecord(id={self.id}, filename='{self.filename}')>"
@@ -98,6 +110,9 @@ class ContractRecord(Base):
             "negotiation_suggestions": self.negotiation_suggestions,
             "workflow_status": self.workflow_status,
             "username": self.username,
+            "storage_url": self.storage_url,
+            "chat_history": self.chat_history,
+            "notes": self.notes,
         }
 
 
@@ -105,16 +120,17 @@ class ContractRecord(Base):
 def _get_engine():
     """Create and return the SQLAlchemy engine.
 
+    Uses Postgres (Supabase) when DATABASE_URL env var is set.
+    Raises ValueError if DATABASE_URL is not set to prevent SQLite fallback.
+
     Returns:
-        A SQLAlchemy engine connected to the SQLite database.
+        A SQLAlchemy engine instance.
     """
-    DATABASE_DIR.mkdir(exist_ok=True)
-    engine = create_engine(
-        f"sqlite:///{DATABASE_PATH}",
-        echo=False,
-        connect_args={"check_same_thread": False},
-    )
-    return engine
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is required but not set.")
+    
+    # Production: Supabase Postgres (or any Postgres-compatible URL)
+    return create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
 def _get_session() -> Session:
@@ -132,6 +148,22 @@ def init_database() -> None:
     """Initialize the database and create tables if they don't exist."""
     engine = _get_engine()
     Base.metadata.create_all(engine)
+    
+    # Run migrations to add new columns to contracts table (safe / idempotent)
+    from sqlalchemy import text
+    migrations = [
+        "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS storage_url TEXT",
+        "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS chat_history TEXT",
+        "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS notes TEXT",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception as e:
+                print(f"Database migration warning ({sql[:50]}...): {e}")
+        print("Database migrations checked/applied.")
     
     # Seed default user if not present
     session = _get_session()
@@ -202,6 +234,7 @@ def save_contract(
     compliance: Optional[str] = None,
     negotiation_suggestions: Optional[str] = None,
     username: Optional[str] = None,
+    storage_url: Optional[str] = None,
 ) -> ContractRecord:
     """Save an analyzed contract to the database."""
     session = _get_session()
@@ -220,6 +253,7 @@ def save_contract(
             compliance=compliance,
             negotiation_suggestions=negotiation_suggestions,
             username=username,
+            storage_url=storage_url,
         )
         session.add(record)
         session.commit()

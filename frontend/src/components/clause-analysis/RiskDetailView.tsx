@@ -1,9 +1,12 @@
 "use client";
 
-import React from "react";
-import { ArrowLeft, User } from "lucide-react";
-import { Clause } from "@/types";
+import React, { useState } from "react";
+import { ArrowLeft, User, Check, AlertCircle, BookmarkPlus, BookmarkCheck } from "lucide-react";
+import { Clause, RiskLevel } from "@/types";
 import RiskBadge from "@/components/ui/RiskBadge";
+import { useContract } from "@/context/ContractContext";
+import { saveClauseToLibrary } from "@/lib/api";
+import { toast } from "sonner";
 
 interface RiskDetailViewProps {
   clause: Clause;
@@ -12,6 +15,55 @@ interface RiskDetailViewProps {
 }
 
 export default function RiskDetailView({ clause, contractName, onBack }: RiskDetailViewProps) {
+  const { selectedContractId, updateContractClauseById } = useContract();
+  const [showOverrideMenu, setShowOverrideMenu] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [isSaved, setIsSaved] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const isConfirmed = clause.status === "Confirmed";
+
+  const handleConfirm = async () => {
+    if (!selectedContractId || isConfirmed || isUpdating) return;
+    setIsUpdating(true);
+    try {
+      await updateContractClauseById(selectedContractId, clause.id, { status: "Confirmed" });
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const handleOverride = async (level: RiskLevel) => {
+    if (!selectedContractId || isUpdating) return;
+    setIsUpdating(true);
+    try {
+      await updateContractClauseById(selectedContractId, clause.id, { riskLevel: level });
+      setShowOverrideMenu(false);
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const handleSaveToLibrary = async () => {
+    if (isSaved || isSaving || !clause.text) return;
+    setIsSaving(true);
+    try {
+      await saveClauseToLibrary({
+        clause_type: clause.name,
+        clause_text: clause.text,
+        source_contract: contractName,
+      });
+      setIsSaved(true);
+      toast.success(`"${clause.name}" saved to clause library`);
+    } catch (err) {
+      toast.error("Failed to save clause to library");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const riskOptions: RiskLevel[] = ["Low", "Medium", "High", "Critical"];
+
   return (
     <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden flex flex-col p-8 space-y-6">
       
@@ -34,9 +86,13 @@ export default function RiskDetailView({ clause, contractName, onBack }: RiskDet
               <span className="w-1.5 h-1.5 rounded-full bg-zinc-400"></span>
               {clause.confidenceLevel} conf.
             </span>
-            <span className="px-2 py-1 bg-amber-50 text-amber-700 rounded text-xs font-semibold flex items-center gap-1.5 border border-amber-200/60">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-              Needs Review
+            <span className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1.5 border ${
+              isConfirmed 
+                ? "bg-teal-50 text-teal-700 border-teal-200/60" 
+                : "bg-amber-50 text-amber-700 border-amber-200/60"
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${isConfirmed ? "bg-teal-500" : "bg-amber-500"}`}></span>
+              {isConfirmed ? "Confirmed" : "Needs Review"}
             </span>
           </div>
         </div>
@@ -116,12 +172,76 @@ export default function RiskDetailView({ clause, contractName, onBack }: RiskDet
       {/* Review Actions */}
       <div className="border border-slate-200 rounded-xl p-6 space-y-4">
         <h3 className="text-sm font-bold text-slate-800">Review Actions</h3>
-        <div className="flex items-center gap-3">
-          <button className="flex items-center gap-2 bg-[#2563eb] hover:bg-blue-600/90 text-white px-5 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-colors">
-            Confirm AI Verdict
+        <div className="flex flex-wrap items-center gap-3">
+          <button 
+            onClick={handleConfirm}
+            disabled={isConfirmed || isUpdating}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-all duration-200 ${
+              isConfirmed 
+                ? "bg-teal-50 border border-teal-200 text-teal-700 cursor-default" 
+                : "bg-[#2563eb] hover:bg-blue-600/90 text-white active:scale-95"
+            }`}
+          >
+            {isConfirmed ? (
+              <>
+                <Check size={16} />
+                Verdict Confirmed
+              </>
+            ) : (
+              "Confirm AI Verdict"
+            )}
           </button>
-          <button className="flex items-center gap-2 bg-white hover:bg-zinc-50 text-zinc-700 border border-zinc-200 px-5 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-colors">
-            Override Risk Level
+          
+          {showOverrideMenu ? (
+            <div className="flex items-center gap-2 animate-in fade-in slide-in-from-left-1 duration-150 py-1">
+              <span className="text-xs font-bold text-slate-500 mr-1 flex items-center gap-1">
+                <AlertCircle size={14} className="text-[#2563eb]" /> Select New Level:
+              </span>
+              {riskOptions.map((level) => (
+                <button
+                  key={level}
+                  onClick={() => handleOverride(level)}
+                  disabled={isUpdating}
+                  className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/50 transition-colors shadow-sm bg-white text-slate-700"
+                >
+                  {level}
+                </button>
+              ))}
+              <button
+                onClick={() => setShowOverrideMenu(false)}
+                disabled={isUpdating}
+                className="px-3 py-1.5 text-xs font-bold rounded-lg text-slate-400 hover:text-slate-600 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button 
+              onClick={() => setShowOverrideMenu(true)}
+              disabled={isUpdating}
+              className="flex items-center gap-2 bg-white hover:bg-zinc-50 text-zinc-700 border border-zinc-200 px-5 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-all active:scale-95 duration-200"
+            >
+              Override Risk Level
+            </button>
+          )}
+
+          {/* Save to Library */}
+          <button
+            onClick={handleSaveToLibrary}
+            disabled={isSaved || isSaving}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-all duration-200 border ${
+              isSaved
+                ? "bg-indigo-50 border-indigo-200 text-indigo-600 cursor-default"
+                : "bg-white hover:bg-indigo-50 border-indigo-200 text-indigo-600 active:scale-95"
+            }`}
+          >
+            {isSaved ? (
+              <><BookmarkCheck size={16} /> Saved to Library</>
+            ) : isSaving ? (
+              <><span className="w-3.5 h-3.5 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" /> Saving...</>
+            ) : (
+              <><BookmarkPlus size={16} /> Save to Library</>
+            )}
           </button>
         </div>
       </div>
@@ -151,7 +271,7 @@ export default function RiskDetailView({ clause, contractName, onBack }: RiskDet
                     </div>
                   ) : (
                     <div className="text-xs text-slate-500 mt-1">
-                      Original: <span className="font-semibold text-slate-700">{clause.riskLevel}</span>
+                      {history.action}
                     </div>
                   )}
                 </div>

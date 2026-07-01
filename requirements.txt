@@ -1,11 +1,11 @@
-streamlit>=1.45.0
+# ── FastAPI backend (deployed on Render) 
 groq>=0.9.0
 sentence-transformers>=3.4.0
 faiss-cpu>=1.9.0
 PyMuPDF>=1.25.0
 sqlalchemy>=2.0.0
+psycopg2-binary           # Postgres driver for Supabase (production DATABASE_URL)
 python-dotenv>=1.1.0
-plotly>=6.0.0
 langchain-text-splitters>=0.3.0
 python-docx>=1.1.0
 numpy>=1.26.0
@@ -15,3 +15,10 @@ fastapi>=0.110.0
 uvicorn>=0.28.0
 python-multipart>=0.0.9
 pydantic>=2.6.0
+supabase                  # Supabase Storage client for persisting extracted contract text
+
+# ── Legacy Streamlit UI (app.py only — NOT deployed on Render) ───────────────
+# Required locally if you run: streamlit run app.py
+# Do NOT include in a Render build that only runs uvicorn main:app
+streamlit>=1.45.0
+plotly>=6.0.0
