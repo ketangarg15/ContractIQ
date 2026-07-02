@@ -120,17 +120,15 @@ class ContractRecord(Base):
 def _get_engine():
     """Create and return the SQLAlchemy engine.
 
-    Uses Postgres (Supabase) when DATABASE_URL env var is set.
-    Raises ValueError if DATABASE_URL is not set to prevent SQLite fallback.
-
-    Returns:
-        A SQLAlchemy engine instance.
+    Uses SQLite by default, falls back to Postgres if DATABASE_URL is set.
     """
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is required but not set.")
+    if DATABASE_URL:
+        return create_engine(DATABASE_URL, pool_pre_ping=True)
     
-    # Production: Supabase Postgres (or any Postgres-compatible URL)
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
+    # SQLite local configuration
+    DATABASE_DIR.mkdir(exist_ok=True)
+    sqlite_url = f"sqlite:///{DATABASE_PATH.as_posix()}"
+    return create_engine(sqlite_url, connect_args={"check_same_thread": False})
 
 
 def _get_session() -> Session:

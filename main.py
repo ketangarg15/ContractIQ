@@ -112,27 +112,10 @@ def startup_event():
 
 @app.post("/api/contracts/upload")
 async def upload_contract(file: UploadFile = File(...), x_username: Optional[str] = Header(None)):
-    """Upload a contract, extract text, chunk it, and save blank database entry."""
+    """Upload a contract, extract text, chunk it, and save database entry locally."""
     filename = file.filename
     uploads_dir = Path("uploads")
     uploads_dir.mkdir(exist_ok=True)
-    file_path = uploads_dir / filename
-
-    # Save uploaded file temporarily
-    try:
-        content = await file.read()
-        with open(file_path, "wb") as buffer:
-            buffer.write(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-
-    # Extract text from temporary file
-    try:
-        text = extract_text(file_path)
-    except Exception as e:
-        if file_path.exists():
-            file_path.unlink()
-        raise HTTPException(status_code=400, detail=f"Failed to extract text: {str(e)}")
 
     # Create database entry to generate contract ID
     session = _get_session()
@@ -142,39 +125,43 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
         session.commit()
         contract_id = record.id
     except Exception as e:
-        if file_path.exists():
-            file_path.unlink()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     finally:
         session.close()
 
-    # Upload raw contract to Supabase Storage contracts bucket & delete local temp file
-    storage_path = None
+    # Save uploaded file locally using the contract ID to avoid conflicts
+    suffix = Path(filename).suffix or ".pdf"
+    file_path = uploads_dir / f"{contract_id}{suffix}"
+
     try:
-        from services.storage_client import upload_contract as upload_raw_contract
-        storage_path = upload_raw_contract(str(contract_id), content, filename)
-        
-        # Update contract record with storage_url/path
-        session = _get_session()
-        try:
-            record = session.query(ContractRecord).filter_by(id=contract_id).first()
-            if record:
-                record.storage_url = storage_path
-                session.commit()
-        finally:
-            session.close()
-            
+        content = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
     except Exception as e:
-        print(f"Supabase Storage raw file upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    # Update contract record with local file path in storage_url
+    session = _get_session()
+    try:
+        record = session.query(ContractRecord).filter_by(id=contract_id).first()
+        if record:
+            record.storage_url = str(file_path.as_posix())
+            session.commit()
     finally:
-        # Guarantee cleanup of temporary file
+        session.close()
+
+    # Extract text from saved local file
+    try:
+        text = extract_text(file_path)
+    except Exception as e:
         if file_path.exists():
             file_path.unlink()
+        raise HTTPException(status_code=400, detail=f"Failed to extract text: {str(e)}")
 
     # Chunk text & build vector store scoped by contract_id
     try:
         chunks = chunk_text(text)
-        # build_vector_store(chunks, contract_id)
+        build_vector_store(chunks, contract_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build vector store: {str(e)}")
 
@@ -184,33 +171,27 @@ async def upload_contract(file: UploadFile = File(...), x_username: Optional[str
     with open(text_dir / f"{contract_id}.txt", "w", encoding="utf-8") as f:
         f.write(text)
 
-    # Save raw text to Supabase Storage (contract-texts bucket)
-    try:
-        from services.storage_client import upload_contract_text
-        upload_contract_text(str(contract_id), text)
-    except Exception as e:
-        print(f"Supabase Storage integration failed during text upload: {e}")
-
-    print(f"Analysis started: Contract {contract_id} uploaded and queued.")
+    print(f"Analysis started: Contract {contract_id} uploaded locally and queued.")
     return {
         "contract_id": contract_id,
         "filename": filename,
         "char_count": len(text),
         "chunk_count": len(chunks),
-        "storage_url": storage_path,
+        "storage_url": str(file_path.as_posix()),
     }
 
 
 @app.get("/api/contracts/{contract_id}/analyze")
 async def analyze_contract(contract_id: int):
     """Run full analysis pipeline and stream status progress via Server-Sent Events."""
+    text_path = Path("contract_texts") / f"{contract_id}.txt"
+    if not text_path.exists():
+        raise HTTPException(status_code=404, detail="Contract text file not found locally")
     try:
-        from services.storage_client import get_contract_text
-        text = get_contract_text(contract_id)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        with open(text_path, "r", encoding="utf-8") as f:
+            text = f.read()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read contract text: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read contract text locally: {e}")
 
     async def run_pipeline():
         print(f"Analysis started for contract {contract_id}...")
@@ -580,18 +561,17 @@ def delete_contract_record(contract_id: int, x_username: Optional[str] = Header(
     if text_path.exists():
         text_path.unlink()
         
-    # Delete raw file and text file from Supabase Storage
-    try:
-        from services.storage_client import delete_contract as delete_storage_contract, get_storage_client, SUPABASE_STORAGE_BUCKET
-        if c.get("storage_url"):
-            delete_storage_contract(c.get("storage_url"))
-        client = get_storage_client()
-        if client:
-            client.storage.from_(SUPABASE_STORAGE_BUCKET).remove([f"{contract_id}.txt"])
-    except Exception as e:
-        print(f"Failed to delete files from Supabase Storage: {e}")
+    # Delete saved local raw uploaded file
+    storage_url = c.get("storage_url")
+    if storage_url:
+        try:
+            local_file = Path(storage_url)
+            if local_file.exists():
+                local_file.unlink()
+        except Exception as e:
+            print(f"Failed to delete local raw file: {e}")
         
-    print(f"Database connected: Deleted contract {contract_id} from database and storage.")
+    print(f"Local storage: Deleted contract {contract_id} from database and local storage.")
     return {"status": "success", "message": f"Contract {contract_id} deleted."}
 
 
